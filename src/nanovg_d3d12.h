@@ -1,5 +1,7 @@
 #define NANOVG_D3D12_IMPLEMENTATION
 
+//*
+
 //
 // Copyright (c) 2009-2013 Mikko Mononen memon@inside.org
 // Port of _gl.h to _d3d12.h by Chris Maughan
@@ -37,7 +39,7 @@ extern "C" {
 // slower, but path overlaps (i.e. self-intersecting or sharp turns) will be drawn just once.
 #define NVG_STENCIL_STROKES 2
 
-	struct NVGcontext* nvgCreateD3D12(ID3D12Device* pDevice, int edgeaa);
+	struct NVGcontext* nvgCreateD3D12(ID3D12Device* pDevice, ID3D12GraphicsCommandList pCmdList, int edgeaa);
 	void nvgDeleteD3D12(struct NVGcontext* ctx);
 
 	// These are additional flags on top of NVGimageFlags.
@@ -223,7 +225,7 @@ struct D3DNVGcontext
 	// D3D
 	// Geometry
 	struct D3DNVGBuffer VertexBuffer;
-	//ID3D12Buffer* pFanIndexBuffer;
+	ID3D12Resource* pFanIndexBuffer;
 	//ID3D12InputLayout* pLayoutRenderTriangles;
 
 	// State
@@ -231,6 +233,7 @@ struct D3DNVGcontext
 	//ID3D12Buffer* pPSConstants;
 
 	ID3D12Device* pDevice;
+	ID3D12GraphicsCommandList* pCmdList;
 	//ID3D12DeviceContext* pDeviceContext;
 
 	//ID3D12BlendState* pBSBlend;
@@ -243,9 +246,6 @@ struct D3DNVGcontext
 	//ID3D12DepthStencilState* pDepthStencilDrawAA;
 	//ID3D12DepthStencilState* pDepthStencilFill;
 	//ID3D12DepthStencilState* pDepthStencilDefault;
-
-	ID3D12CommandAllocator* pCommandAllocator;
-	ID3D12GraphicsCommandList* pCommandList;
 };
 
 static int D3Dnvg__maxi(int a, int b) { return a > b ? a : b; }
@@ -347,7 +347,7 @@ static int D3Dnvg__createShader(struct D3DNVGcontext* D3D, struct D3DNVGshader* 
 	vs.pShaderBytecode = vshader;
 	vs.BytecodeLength = vshader_size;
 
-	hr = D3DReadFileToBlob(vshader, &vert);
+	//hr = D3DReadFileToBlob(vshader, &vert);
 	// TODO バイトコードからシェーダオブジェクトの生成
 	shader->vert = vert;
 	shader->frag = frag;
@@ -367,11 +367,10 @@ void D3Dnvg_buildFanIndices(struct D3DNVGcontext* D3D)
 	UINT32 index1 = 1;
 	UINT32 index2 = 2;
 	UINT32 current = 0;
-	ID3D12Resource* resource;
 	UINT32* pIndices = NULL;
 
-	D3D_API_5(D3D->pDeviceContext, Map, (ID3D12Resource*)D3D->pFanIndexBuffer, 0, D3D12_MAP_WRITE_DISCARD, 0, &resource);
-	pIndices = (UINT32*)resource.pData;
+	HRESULT result;
+	result = D3D->pFanIndexBuffer->Map(0, nullptr, (void**)&pIndices);
 
 	while (current < (D3D->VertexBuffer.MaxBufferEntries - 3))
 	{
@@ -379,12 +378,13 @@ void D3Dnvg_buildFanIndices(struct D3DNVGcontext* D3D)
 		pIndices[current++] = index1++;
 		pIndices[current++] = index2++;
 	}
-	D3D_API_2(D3D->pDeviceContext, Unmap, (ID3D12Resource*)D3D->pFanIndexBuffer, 0);
+	D3D->pFanIndexBuffer->Unmap(0, nullptr);
 }
 
 struct NVGvertex* D3Dnvg_beginVertexBuffer(struct D3DNVGcontext* D3D, unsigned int maxCount, unsigned int* baseOffset)
 {
-	D3D12_MAPPED_SUBRESOURCE resource;
+	HRESULT result;
+	unsigned char* resource;
 	if (maxCount >= D3D->VertexBuffer.MaxBufferEntries)
 	{
 		D3Dnvg__checkError(E_FAIL, "Vertex buffer too small!");
@@ -394,20 +394,20 @@ struct NVGvertex* D3Dnvg_beginVertexBuffer(struct D3DNVGcontext* D3D, unsigned i
 	{
 		*baseOffset = 0;
 		D3D->VertexBuffer.CurrentBufferEntry = maxCount;
-		D3D_API_5(D3D->pDeviceContext, Map, (ID3D12Resource*)D3D->VertexBuffer.pBuffer, 0, D3D12_MAP_WRITE_DISCARD, 0, &resource);
+		result = D3D->VertexBuffer.pBuffer->Map(0, nullptr, (void**)&resource);
 	}
 	else
 	{
 		*baseOffset = D3D->VertexBuffer.CurrentBufferEntry;
 		D3D->VertexBuffer.CurrentBufferEntry = *baseOffset + maxCount;
-		D3D_API_5(D3D->pDeviceContext, Map, (ID3D12Resource*)D3D->VertexBuffer.pBuffer, 0, D3D12_MAP_WRITE_NO_OVERWRITE, 0, &resource);
+		result = D3D->VertexBuffer.pBuffer->Map(0, nullptr, (void**)&resource);
 	}
-	return ((struct NVGvertex*)resource.pData + *baseOffset);
+	return ((struct NVGvertex*)resource + *baseOffset);
 }
 
 void D3Dnvg_endVertexBuffer(struct D3DNVGcontext* D3D)
 {
-	D3D_API_2(D3D->pDeviceContext, Unmap, (ID3D12Resource*)D3D->VertexBuffer.pBuffer, 0);
+	D3D->VertexBuffer.pBuffer->Unmap(0, nullptr);
 }
 
 static void D3Dnvg__copyVerts(struct NVGvertex* pDest, const struct NVGvertex* pSource, unsigned int num)
@@ -422,9 +422,10 @@ static void D3Dnvg__copyVerts(struct NVGvertex* pDest, const struct NVGvertex* p
 	}
 }
 
-static unsigned int D3Dnvg_updateVertexBuffer(ID3D12DeviceContext* pContext, struct D3DNVGBuffer* buffer, const struct NVGvertex* verts, unsigned int nverts)
+static unsigned int D3Dnvg_updateVertexBuffer(D3DNVGcontext* D3D, struct D3DNVGBuffer* buffer, const struct NVGvertex* verts, unsigned int nverts)
 {
-	D3D12_MAPPED_SUBRESOURCE resource;
+	HRESULT result;
+	unsigned char* resource;
 	unsigned int retEntry;
 
 	if (nverts > buffer->MaxBufferEntries)
@@ -435,16 +436,16 @@ static unsigned int D3Dnvg_updateVertexBuffer(ID3D12DeviceContext* pContext, str
 	if ((buffer->CurrentBufferEntry + nverts) >= buffer->MaxBufferEntries)
 	{
 		buffer->CurrentBufferEntry = 0;
-		D3D_API_5(pContext, Map, (ID3D12Resource*)buffer->pBuffer, 0, D3D12_MAP_WRITE_DISCARD, 0, &resource);
+		result = buffer->pBuffer->Map(0, nullptr, (void**)&resource);
 	}
 	else
 	{
-		D3D_API_5(pContext, Map, (ID3D12Resource*)buffer->pBuffer, 0, D3D12_MAP_WRITE_NO_OVERWRITE, 0, &resource);
+		result = buffer->pBuffer->Map(0, nullptr, (void**)&resource);
 	}
 
-	D3Dnvg__copyVerts((((struct NVGvertex*)resource.pData) + buffer->CurrentBufferEntry), (const struct NVGvertex*)verts, nverts);
+	D3Dnvg__copyVerts((((struct NVGvertex*)resource) + buffer->CurrentBufferEntry), (const struct NVGvertex*)verts, nverts);
 
-	D3D_API_2(pContext, Unmap, (ID3D12Resource*)buffer->pBuffer, 0);
+	buffer->pBuffer->Unmap(0, nullptr);
 	retEntry = buffer->CurrentBufferEntry;
 	buffer->CurrentBufferEntry += nverts;
 	return retEntry;
@@ -452,7 +453,7 @@ static unsigned int D3Dnvg_updateVertexBuffer(ID3D12DeviceContext* pContext, str
 
 static void D3Dnvg_setBuffers(struct D3DNVGcontext* D3D, unsigned int dynamicOffset)
 {
-	ID3D12Buffer* pBuffers[1];
+	ID3D12Resource* pBuffers[1];
 	unsigned int strides[1];
 	unsigned int offsets[1];
 
@@ -460,311 +461,322 @@ static void D3Dnvg_setBuffers(struct D3DNVGcontext* D3D, unsigned int dynamicOff
 	strides[0] = sizeof(struct NVGvertex);
 	offsets[0] = dynamicOffset * sizeof(struct NVGvertex);
 
-	D3D_API_3(D3D->pDeviceContext, IASetIndexBuffer, D3D->pFanIndexBuffer, DXGI_FORMAT_R32_UINT, 0);
-	D3D_API_5(D3D->pDeviceContext, IASetVertexBuffers, 0, 1, pBuffers, strides, offsets);
+	D3D->pCmdList->IASetIndexBuffer(D3D->pFanIndexBufferView);
+	D3D->pCmdList->IASetVertexBuffers(0, 1, D3D->VertexBufferView);
+
+	// TODO 頂点レイアウト
 	D3D_API_1(D3D->pDeviceContext, IASetInputLayout, D3D->pLayoutRenderTriangles);
 }
 
 static int D3Dnvg__renderCreate(void* uptr)
 {
-	HRESULT hr;
-	D3D12_BUFFER_DESC bufferDesc;
-	D3D12_RASTERIZER_DESC rasterDesc;
-	D3D12_BLEND_DESC blendDesc;
-	D3D12_DEPTH_STENCIL_DESC depthStencilDesc;
-	D3D12_SAMPLER_DESC sampDesc;
+	// TODO D3Dnvg__renderCreate
+	//HRESULT hr;
+	//D3D12_BUFFER_DESC bufferDesc;
+	//D3D12_RASTERIZER_DESC rasterDesc;
+	//D3D12_BLEND_DESC blendDesc;
+	//D3D12_DEPTH_STENCIL_DESC depthStencilDesc;
+	//D3D12_SAMPLER_DESC sampDesc;
 
-	struct D3DNVGcontext* D3D = (struct D3DNVGcontext*)uptr;
+	//struct D3DNVGcontext* D3D = (struct D3DNVGcontext*)uptr;
 
-	const D3D12_DEPTH_STENCILOP_DESC frontOp = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_INCR, D3D12_COMPARISON_ALWAYS };
-	const D3D12_DEPTH_STENCILOP_DESC backOp = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_DECR, D3D12_COMPARISON_ALWAYS };
+	//const D3D12_DEPTH_STENCILOP_DESC frontOp = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_INCR, D3D12_COMPARISON_ALWAYS };
+	//const D3D12_DEPTH_STENCILOP_DESC backOp = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_DECR, D3D12_COMPARISON_ALWAYS };
 
-	const D3D12_DEPTH_STENCILOP_DESC aaOp = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_EQUAL };
-	const D3D12_DEPTH_STENCILOP_DESC fillOp = { D3D12_STENCIL_OP_ZERO, D3D12_STENCIL_OP_ZERO, D3D12_STENCIL_OP_ZERO, D3D12_COMPARISON_NOT_EQUAL };
+	//const D3D12_DEPTH_STENCILOP_DESC aaOp = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_EQUAL };
+	//const D3D12_DEPTH_STENCILOP_DESC fillOp = { D3D12_STENCIL_OP_ZERO, D3D12_STENCIL_OP_ZERO, D3D12_STENCIL_OP_ZERO, D3D12_COMPARISON_NOT_EQUAL };
 
-	const D3D12_DEPTH_STENCILOP_DESC defaultOp = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_ALWAYS };
+	//const D3D12_DEPTH_STENCILOP_DESC defaultOp = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_ALWAYS };
 
-	D3D12_INPUT_ELEMENT_DESC LayoutRenderTriangles[] =
-	{
-		{ "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_PER_VERTEX_DATA, 0 },
-		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D12_INPUT_PER_VERTEX_DATA, 0 }
-	};
+	//D3D12_INPUT_ELEMENT_DESC LayoutRenderTriangles[] =
+	//{
+	//	{ "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_PER_VERTEX_DATA, 0 },
+	//	{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D12_INPUT_PER_VERTEX_DATA, 0 }
+	//};
 
-	if (D3D->flags & NVG_ANTIALIAS)
-	{
-		if (D3Dnvg__createShader(D3D, &D3D->shader, g_D3D11VertexShader_Main, sizeof(g_D3D11VertexShader_Main), g_D3D11PixelShaderAA_Main, sizeof(g_D3D12PixelShaderAA_Main)) == 0)
-			return 0;
-	}
-	else
-	{
-		if (D3Dnvg__createShader(D3D, &D3D->shader, g_D3D11VertexShader_Main, sizeof(g_D3D11VertexShader_Main), g_D3D11PixelShader_Main, sizeof(g_D3D12PixelShader_Main)) == 0)
-			return 0;
-	}
+	//if (D3D->flags & NVG_ANTIALIAS)
+	//{
+	//	if (D3Dnvg__createShader(D3D, &D3D->shader, g_D3D11VertexShader_Main, sizeof(g_D3D11VertexShader_Main), g_D3D11PixelShaderAA_Main, sizeof(g_D3D12PixelShaderAA_Main)) == 0)
+	//		return 0;
+	//}
+	//else
+	//{
+	//	if (D3Dnvg__createShader(D3D, &D3D->shader, g_D3D11VertexShader_Main, sizeof(g_D3D11VertexShader_Main), g_D3D11PixelShader_Main, sizeof(g_D3D12PixelShader_Main)) == 0)
+	//		return 0;
+	//}
 
-	// Todo: Need to find a good value for this, and
-	// Use the dynamic buffer fill technnique to handle overflow
-	D3D->VertexBuffer.MaxBufferEntries = 1000000;
-	D3D->VertexBuffer.CurrentBufferEntry = 0;
+	//// Todo: Need to find a good value for this, and
+	//// Use the dynamic buffer fill technnique to handle overflow
+	//D3D->VertexBuffer.MaxBufferEntries = 1000000;
+	//D3D->VertexBuffer.CurrentBufferEntry = 0;
 
-	memset(&bufferDesc, 0, sizeof(bufferDesc));
-	bufferDesc.Usage = D3D12_USAGE_DYNAMIC;
-	bufferDesc.BindFlags = D3D12_BIND_VERTEX_BUFFER;
-	bufferDesc.CPUAccessFlags = D3D12_CPU_ACCESS_WRITE;
-	bufferDesc.MiscFlags = 0;
+	//memset(&bufferDesc, 0, sizeof(bufferDesc));
+	//bufferDesc.Usage = D3D12_USAGE_DYNAMIC;
+	//bufferDesc.BindFlags = D3D12_BIND_VERTEX_BUFFER;
+	//bufferDesc.CPUAccessFlags = D3D12_CPU_ACCESS_WRITE;
+	//bufferDesc.MiscFlags = 0;
 
-	// Create the vertex buffer.
-	bufferDesc.ByteWidth = sizeof(struct NVGvertex) * D3D->VertexBuffer.MaxBufferEntries;
-	hr = D3D_API_3(D3D->pDevice, CreateBuffer, &bufferDesc, NULL, &D3D->VertexBuffer.pBuffer);
-	D3Dnvg__checkError(hr, "Create Vertex Buffer");
+	//// Create the vertex buffer.
+	//bufferDesc.ByteWidth = sizeof(struct NVGvertex) * D3D->VertexBuffer.MaxBufferEntries;
+	//hr = D3D_API_3(D3D->pDevice, CreateBuffer, &bufferDesc, NULL, &D3D->VertexBuffer.pBuffer);
+	//D3Dnvg__checkError(hr, "Create Vertex Buffer");
 
-	bufferDesc.BindFlags = D3D12_BIND_INDEX_BUFFER;
-	bufferDesc.ByteWidth = sizeof(UINT32) * D3D->VertexBuffer.MaxBufferEntries;
-	hr = D3D_API_3(D3D->pDevice, CreateBuffer, &bufferDesc, NULL, &D3D->pFanIndexBuffer);
-	D3Dnvg__checkError(hr, "Create Vertex Buffer Static");
+	//bufferDesc.BindFlags = D3D12_BIND_INDEX_BUFFER;
+	//bufferDesc.ByteWidth = sizeof(UINT32) * D3D->VertexBuffer.MaxBufferEntries;
+	//hr = D3D_API_3(D3D->pDevice, CreateBuffer, &bufferDesc, NULL, &D3D->pFanIndexBuffer);
+	//D3Dnvg__checkError(hr, "Create Vertex Buffer Static");
 
-	D3Dnvg_buildFanIndices(D3D);
+	//D3Dnvg_buildFanIndices(D3D);
 
-	hr = D3D_API_5(D3D->pDevice, CreateInputLayout, LayoutRenderTriangles, 2, g_D3D12VertexShader_Main, sizeof(g_D3D12VertexShader_Main), &D3D->pLayoutRenderTriangles);
-	D3Dnvg__checkError(hr, "Create Input Layout");
+	//hr = D3D_API_5(D3D->pDevice, CreateInputLayout, LayoutRenderTriangles, 2, g_D3D12VertexShader_Main, sizeof(g_D3D12VertexShader_Main), &D3D->pLayoutRenderTriangles);
+	//D3Dnvg__checkError(hr, "Create Input Layout");
 
-	bufferDesc.Usage = D3D12_USAGE_DYNAMIC;
-	bufferDesc.BindFlags = D3D12_BIND_CONSTANT_BUFFER;
-	bufferDesc.CPUAccessFlags = D3D12_CPU_ACCESS_WRITE;
-	bufferDesc.MiscFlags = 0;
-	bufferDesc.ByteWidth = sizeof(struct VS_CONSTANTS);
-	if ((bufferDesc.ByteWidth % 16) != 0)
-	{
-		bufferDesc.ByteWidth += 16 - (bufferDesc.ByteWidth % 16);
-	}
+	//bufferDesc.Usage = D3D12_USAGE_DYNAMIC;
+	//bufferDesc.BindFlags = D3D12_BIND_CONSTANT_BUFFER;
+	//bufferDesc.CPUAccessFlags = D3D12_CPU_ACCESS_WRITE;
+	//bufferDesc.MiscFlags = 0;
+	//bufferDesc.ByteWidth = sizeof(struct VS_CONSTANTS);
+	//if ((bufferDesc.ByteWidth % 16) != 0)
+	//{
+	//	bufferDesc.ByteWidth += 16 - (bufferDesc.ByteWidth % 16);
+	//}
 
-	hr = D3D_API_3(D3D->pDevice, CreateBuffer, &bufferDesc, NULL, &D3D->pVSConstants);
-	D3Dnvg__checkError(hr, "Create Constant Buffer");
+	//hr = D3D_API_3(D3D->pDevice, CreateBuffer, &bufferDesc, NULL, &D3D->pVSConstants);
+	//D3Dnvg__checkError(hr, "Create Constant Buffer");
 
-	bufferDesc.ByteWidth = sizeof(struct D3DNVGfragUniforms);
-	if ((bufferDesc.ByteWidth % 16) != 0)
-	{
-		bufferDesc.ByteWidth += 16 - (bufferDesc.ByteWidth % 16);
-	}
-	D3D->fragSize = bufferDesc.ByteWidth;
+	//bufferDesc.ByteWidth = sizeof(struct D3DNVGfragUniforms);
+	//if ((bufferDesc.ByteWidth % 16) != 0)
+	//{
+	//	bufferDesc.ByteWidth += 16 - (bufferDesc.ByteWidth % 16);
+	//}
+	//D3D->fragSize = bufferDesc.ByteWidth;
 
-	hr = D3D_API_3(D3D->pDevice, CreateBuffer, &bufferDesc, NULL, &D3D->pPSConstants);
-	D3Dnvg__checkError(hr, "Create Constant Buffer");
+	//hr = D3D_API_3(D3D->pDevice, CreateBuffer, &bufferDesc, NULL, &D3D->pPSConstants);
+	//D3Dnvg__checkError(hr, "Create Constant Buffer");
 
-	ZeroMemory(&rasterDesc, sizeof(rasterDesc));
-	rasterDesc.FillMode = D3D12_FILL_SOLID;
-	rasterDesc.CullMode = D3D12_CULL_NONE;
-	rasterDesc.DepthClipEnable = TRUE;
-	rasterDesc.FrontCounterClockwise = TRUE;
-	hr = D3D_API_2(D3D->pDevice, CreateRasterizerState, &rasterDesc, &D3D->pRSNoCull);
+	//ZeroMemory(&rasterDesc, sizeof(rasterDesc));
+	//rasterDesc.FillMode = D3D12_FILL_SOLID;
+	//rasterDesc.CullMode = D3D12_CULL_NONE;
+	//rasterDesc.DepthClipEnable = TRUE;
+	//rasterDesc.FrontCounterClockwise = TRUE;
+	//hr = D3D_API_2(D3D->pDevice, CreateRasterizerState, &rasterDesc, &D3D->pRSNoCull);
 
-	rasterDesc.CullMode = D3D12_CULL_BACK;
-	hr = D3D_API_2(D3D->pDevice, CreateRasterizerState, &rasterDesc, &D3D->pRSCull);
+	//rasterDesc.CullMode = D3D12_CULL_BACK;
+	//hr = D3D_API_2(D3D->pDevice, CreateRasterizerState, &rasterDesc, &D3D->pRSCull);
 
-	ZeroMemory(&blendDesc, sizeof(blendDesc));
-	blendDesc.RenderTarget[0].BlendEnable = TRUE;
-	blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-	blendDesc.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-	blendDesc.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
-	blendDesc.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
-	blendDesc.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
-	blendDesc.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-	blendDesc.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-	blendDesc.IndependentBlendEnable = FALSE;
-	hr = D3D_API_2(D3D->pDevice, CreateBlendState, &blendDesc, &D3D->pBSBlend);
+	//ZeroMemory(&blendDesc, sizeof(blendDesc));
+	//blendDesc.RenderTarget[0].BlendEnable = TRUE;
+	//blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	//blendDesc.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+	//blendDesc.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	//blendDesc.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+	//blendDesc.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+	//blendDesc.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+	//blendDesc.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+	//blendDesc.IndependentBlendEnable = FALSE;
+	//hr = D3D_API_2(D3D->pDevice, CreateBlendState, &blendDesc, &D3D->pBSBlend);
 
 
-	blendDesc.RenderTarget[0].BlendEnable = FALSE;
-	blendDesc.RenderTarget[0].RenderTargetWriteMask = 0;
-	hr = D3D_API_2(D3D->pDevice, CreateBlendState, &blendDesc, &D3D->pBSNoWrite);
+	//blendDesc.RenderTarget[0].BlendEnable = FALSE;
+	//blendDesc.RenderTarget[0].RenderTargetWriteMask = 0;
+	//hr = D3D_API_2(D3D->pDevice, CreateBlendState, &blendDesc, &D3D->pBSNoWrite);
 
-	// Stencil A Draw shapes
-	ZeroMemory(&depthStencilDesc, sizeof(depthStencilDesc));
-	depthStencilDesc.DepthEnable = FALSE;
-	depthStencilDesc.DepthFunc = D3D12_COMPARISON_LESS_EQUAL;
-	depthStencilDesc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-	depthStencilDesc.StencilEnable = TRUE;
-	depthStencilDesc.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
-	depthStencilDesc.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+	//// Stencil A Draw shapes
+	//ZeroMemory(&depthStencilDesc, sizeof(depthStencilDesc));
+	//depthStencilDesc.DepthEnable = FALSE;
+	//depthStencilDesc.DepthFunc = D3D12_COMPARISON_LESS_EQUAL;
+	//depthStencilDesc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+	//depthStencilDesc.StencilEnable = TRUE;
+	//depthStencilDesc.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+	//depthStencilDesc.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
 
-	depthStencilDesc.FrontFace = frontOp;
-	depthStencilDesc.BackFace = backOp;
+	//depthStencilDesc.FrontFace = frontOp;
+	//depthStencilDesc.BackFace = backOp;
 
-	// No color write
-	hr = D3D_API_2(D3D->pDevice, CreateDepthStencilState, &depthStencilDesc, &D3D->pDepthStencilDrawShapes);
+	//// No color write
+	//hr = D3D_API_2(D3D->pDevice, CreateDepthStencilState, &depthStencilDesc, &D3D->pDepthStencilDrawShapes);
 
-	// Draw AA
-	depthStencilDesc.FrontFace = aaOp;
-	depthStencilDesc.BackFace = aaOp;
+	//// Draw AA
+	//depthStencilDesc.FrontFace = aaOp;
+	//depthStencilDesc.BackFace = aaOp;
 
-	hr = D3D_API_2(D3D->pDevice, CreateDepthStencilState, &depthStencilDesc, &D3D->pDepthStencilDrawAA);
+	//hr = D3D_API_2(D3D->pDevice, CreateDepthStencilState, &depthStencilDesc, &D3D->pDepthStencilDrawAA);
 
-	// Stencil Fill
-	depthStencilDesc.FrontFace = fillOp;
-	depthStencilDesc.BackFace = fillOp;
-	hr = D3D_API_2(D3D->pDevice, CreateDepthStencilState, &depthStencilDesc, &D3D->pDepthStencilFill);
+	//// Stencil Fill
+	//depthStencilDesc.FrontFace = fillOp;
+	//depthStencilDesc.BackFace = fillOp;
+	//hr = D3D_API_2(D3D->pDevice, CreateDepthStencilState, &depthStencilDesc, &D3D->pDepthStencilFill);
 
-	depthStencilDesc.FrontFace = defaultOp;
-	depthStencilDesc.BackFace = defaultOp;
-	depthStencilDesc.StencilEnable = FALSE;
-	hr = D3D_API_2(D3D->pDevice, CreateDepthStencilState, &depthStencilDesc, &D3D->pDepthStencilDefault);
+	//depthStencilDesc.FrontFace = defaultOp;
+	//depthStencilDesc.BackFace = defaultOp;
+	//depthStencilDesc.StencilEnable = FALSE;
+	//hr = D3D_API_2(D3D->pDevice, CreateDepthStencilState, &depthStencilDesc, &D3D->pDepthStencilDefault);
 
-	ZeroMemory(&sampDesc, sizeof(sampDesc));
-	sampDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-	sampDesc.AddressW = D3D12_TEXTURE_ADDRESS_WRAP;
-	sampDesc.ComparisonFunc = D3D12_COMPARISON_NEVER;
-	sampDesc.MinLOD = 0;
-	sampDesc.MaxLOD = D3D12_FLOAT32_MAX;
-	sampDesc.MipLODBias = 0.0f;//-1.0f;
+	//ZeroMemory(&sampDesc, sizeof(sampDesc));
+	//sampDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+	//sampDesc.AddressW = D3D12_TEXTURE_ADDRESS_WRAP;
+	//sampDesc.ComparisonFunc = D3D12_COMPARISON_NEVER;
+	//sampDesc.MinLOD = 0;
+	//sampDesc.MaxLOD = D3D12_FLOAT32_MAX;
+	//sampDesc.MipLODBias = 0.0f;//-1.0f;
 
-	sampDesc.AddressU = D3D12_TEXTURE_ADDRESS_CLAMP;
-	sampDesc.AddressV = D3D12_TEXTURE_ADDRESS_CLAMP;
-	D3D_API_2(D3D->pDevice, CreateSamplerState, &sampDesc, &D3D->pSamplerState[0]);
+	//sampDesc.AddressU = D3D12_TEXTURE_ADDRESS_CLAMP;
+	//sampDesc.AddressV = D3D12_TEXTURE_ADDRESS_CLAMP;
+	//D3D_API_2(D3D->pDevice, CreateSamplerState, &sampDesc, &D3D->pSamplerState[0]);
 
-	sampDesc.AddressU = D3D12_TEXTURE_ADDRESS_WRAP;
-	sampDesc.AddressV = D3D12_TEXTURE_ADDRESS_CLAMP;
-	D3D_API_2(D3D->pDevice, CreateSamplerState, &sampDesc, &D3D->pSamplerState[1]);
+	//sampDesc.AddressU = D3D12_TEXTURE_ADDRESS_WRAP;
+	//sampDesc.AddressV = D3D12_TEXTURE_ADDRESS_CLAMP;
+	//D3D_API_2(D3D->pDevice, CreateSamplerState, &sampDesc, &D3D->pSamplerState[1]);
 
-	sampDesc.AddressU = D3D12_TEXTURE_ADDRESS_CLAMP;
-	sampDesc.AddressV = D3D12_TEXTURE_ADDRESS_WRAP;
-	D3D_API_2(D3D->pDevice, CreateSamplerState, &sampDesc, &D3D->pSamplerState[2]);
+	//sampDesc.AddressU = D3D12_TEXTURE_ADDRESS_CLAMP;
+	//sampDesc.AddressV = D3D12_TEXTURE_ADDRESS_WRAP;
+	//D3D_API_2(D3D->pDevice, CreateSamplerState, &sampDesc, &D3D->pSamplerState[2]);
 
-	sampDesc.AddressU = D3D12_TEXTURE_ADDRESS_WRAP;
-	sampDesc.AddressV = D3D12_TEXTURE_ADDRESS_WRAP;
-	D3D_API_2(D3D->pDevice, CreateSamplerState, &sampDesc, &D3D->pSamplerState[3]);
+	//sampDesc.AddressU = D3D12_TEXTURE_ADDRESS_WRAP;
+	//sampDesc.AddressV = D3D12_TEXTURE_ADDRESS_WRAP;
+	//D3D_API_2(D3D->pDevice, CreateSamplerState, &sampDesc, &D3D->pSamplerState[3]);
 
 	return 1;
 }
 
 static int D3Dnvg__renderCreateTexture(void* uptr, int type, int w, int h, int imageFlags, const unsigned char* data)
 {
-	struct D3DNVGcontext* D3D = (struct D3DNVGcontext*)uptr;
-	struct D3DNVGtexture* tex = D3Dnvg__allocTexture(D3D);
-	D3D12_TEXTURE2D_DESC texDesc;
-	int pixelWidthBytes;
-	HRESULT hr;
-	D3D12_SHADER_RESOURCE_VIEW_DESC viewDesc;
+	// TODO D3Dnvg__renderCreateTexture
+	//struct D3DNVGcontext* D3D = (struct D3DNVGcontext*)uptr;
+	//struct D3DNVGtexture* tex = D3Dnvg__allocTexture(D3D);
+	//D3D12_TEXTURE2D_DESC texDesc;
+	//int pixelWidthBytes;
+	//HRESULT hr;
+	//D3D12_SHADER_RESOURCE_VIEW_DESC viewDesc;
 
-	if (tex == NULL)
-	{
-		return 0;
-	}
+	//if (tex == NULL)
+	//{
+	//	return 0;
+	//}
 
-	tex->width = w;
-	tex->height = h;
-	tex->type = type;
-	tex->flags = imageFlags;
+	//tex->width = w;
+	//tex->height = h;
+	//tex->type = type;
+	//tex->flags = imageFlags;
 
-	memset(&texDesc, 0, sizeof(texDesc));
-	texDesc.ArraySize = 1;
-	texDesc.BindFlags = D3D12_BIND_SHADER_RESOURCE;
-	texDesc.CPUAccessFlags = 0;
-	texDesc.MipLevels = 1;
-	if (type == NVG_TEXTURE_RGBA)
-	{
-		texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-		pixelWidthBytes = 4;
+	//memset(&texDesc, 0, sizeof(texDesc));
+	//texDesc.ArraySize = 1;
+	//texDesc.BindFlags = D3D12_BIND_SHADER_RESOURCE;
+	//texDesc.CPUAccessFlags = 0;
+	//texDesc.MipLevels = 1;
+	//if (type == NVG_TEXTURE_RGBA)
+	//{
+	//	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	//	pixelWidthBytes = 4;
 
-		// Mip maps
-		if (imageFlags & NVG_IMAGE_GENERATE_MIPMAPS)
-		{
-			texDesc.MipLevels = 0;
-			texDesc.BindFlags |= D3D12_BIND_RENDER_TARGET;
-			texDesc.MiscFlags = D3D12_RESOURCE_MISC_GENERATE_MIPS;
-		}
-	}
-	else
-	{
-		texDesc.Format = DXGI_FORMAT_R8_UNORM;
-		pixelWidthBytes = 1;
-		texDesc.MipLevels = 1;
-	}
-	texDesc.Height = tex->height;
-	texDesc.Width = tex->width;
-	texDesc.SampleDesc.Count = 1;
-	texDesc.SampleDesc.Quality = 0;
-	texDesc.Usage = D3D12_USAGE_DEFAULT;
+	//	// Mip maps
+	//	if (imageFlags & NVG_IMAGE_GENERATE_MIPMAPS)
+	//	{
+	//		texDesc.MipLevels = 0;
+	//		texDesc.BindFlags |= D3D12_BIND_RENDER_TARGET;
+	//		texDesc.MiscFlags = D3D12_RESOURCE_MISC_GENERATE_MIPS;
+	//	}
+	//}
+	//else
+	//{
+	//	texDesc.Format = DXGI_FORMAT_R8_UNORM;
+	//	pixelWidthBytes = 1;
+	//	texDesc.MipLevels = 1;
+	//}
+	//texDesc.Height = tex->height;
+	//texDesc.Width = tex->width;
+	//texDesc.SampleDesc.Count = 1;
+	//texDesc.SampleDesc.Quality = 0;
+	//texDesc.Usage = D3D12_USAGE_DEFAULT;
 
-	hr = D3D_API_3(D3D->pDevice, CreateTexture2D, &texDesc, NULL, &tex->tex);
-	if (FAILED(hr))
-	{
-		return 0;
-	}
+	//hr = D3D_API_3(D3D->pDevice, CreateTexture2D, &texDesc, NULL, &tex->tex);
+	//if (FAILED(hr))
+	//{
+	//	return 0;
+	//}
 
-	if (data != NULL)
-	{
-		D3D_API_6(D3D->pDeviceContext, UpdateSubresource, (ID3D12Resource*)tex->tex, 0, NULL, data, tex->width * pixelWidthBytes, (tex->width * tex->height) * pixelWidthBytes);
-	}
+	//if (data != NULL)
+	//{
+	//	D3D_API_6(D3D->pDeviceContext, UpdateSubresource, (ID3D12Resource*)tex->tex, 0, NULL, data, tex->width * pixelWidthBytes, (tex->width * tex->height) * pixelWidthBytes);
+	//}
 
-	viewDesc.Format = texDesc.Format;
-	viewDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-	viewDesc.Texture2D.MipLevels = (UINT)-1;
-	viewDesc.Texture2D.MostDetailedMip = 0;
+	//viewDesc.Format = texDesc.Format;
+	//viewDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	//viewDesc.Texture2D.MipLevels = (UINT)-1;
+	//viewDesc.Texture2D.MostDetailedMip = 0;
 
-	D3D_API_3(D3D->pDevice, CreateShaderResourceView, (ID3D12Resource*)tex->tex, &viewDesc, &tex->resourceView);
+	//D3D_API_3(D3D->pDevice, CreateShaderResourceView, (ID3D12Resource*)tex->tex, &viewDesc, &tex->resourceView);
 
-	if (data != NULL && texDesc.MipLevels == 0)
-	{
-		D3D_API_1(D3D->pDeviceContext, GenerateMips, tex->resourceView);
-	}
+	//if (data != NULL && texDesc.MipLevels == 0)
+	//{
+	//	D3D_API_1(D3D->pDeviceContext, GenerateMips, tex->resourceView);
+	//}
 
-	if (D3Dnvg__checkError(hr, "create tex"))
-		return 0;
+	//if (D3Dnvg__checkError(hr, "create tex"))
+	//	return 0;
 
-	return tex->id;
+	//return tex->id;
+	return 0;
 }
 
 static int D3Dnvg__renderDeleteTexture(void* uptr, int image)
 {
-	struct D3DNVGcontext* D3D = (struct D3DNVGcontext*)uptr;
-	return D3Dnvg__deleteTexture(D3D, image);
+	// TODO D3Dnvg__renderDeleteTexture
+	//struct D3DNVGcontext* D3D = (struct D3DNVGcontext*)uptr;
+	//return D3Dnvg__deleteTexture(D3D, image);
+	return 0;
 }
 
 static int D3Dnvg__renderUpdateTexture(void* uptr, int image, int x, int y, int w, int h, const unsigned char* data)
 {
-	struct D3DNVGcontext* D3D = (struct D3DNVGcontext*)uptr;
-	struct D3DNVGtexture* tex = D3Dnvg__findTexture(D3D, image);
-	D3D12_BOX box;
-	unsigned int pixelWidthBytes;
-	unsigned char* pData;
+	// TODO D3Dnvg__renderUpdateTexture
+	//struct D3DNVGcontext* D3D = (struct D3DNVGcontext*)uptr;
+	//struct D3DNVGtexture* tex = D3Dnvg__findTexture(D3D, image);
+	//D3D12_BOX box;
+	//unsigned int pixelWidthBytes;
+	//unsigned char* pData;
 
-	if (tex == NULL)
-	{
-		return 0;
-	}
+	//if (tex == NULL)
+	//{
+	//	return 0;
+	//}
 
-	box.left = x;
-	box.right = (x + w);
-	box.top = y;
-	box.bottom = (y + h);
-	box.front = 0;
-	box.back = 1;
+	//box.left = x;
+	//box.right = (x + w);
+	//box.top = y;
+	//box.bottom = (y + h);
+	//box.front = 0;
+	//box.back = 1;
 
-	if (tex->type == NVG_TEXTURE_RGBA)
-	{
-		pixelWidthBytes = 4;
-	}
-	else
-	{
-		pixelWidthBytes = 1;
-	}
+	//if (tex->type == NVG_TEXTURE_RGBA)
+	//{
+	//	pixelWidthBytes = 4;
+	//}
+	//else
+	//{
+	//	pixelWidthBytes = 1;
+	//}
 
-	pData = (unsigned char*)data + (y * (tex->width * pixelWidthBytes)) + (x * pixelWidthBytes);
-	D3D_API_6(D3D->pDeviceContext, UpdateSubresource, (ID3D12Resource*)tex->tex, 0, &box, pData, tex->width, tex->width * tex->height);
+	//pData = (unsigned char*)data + (y * (tex->width * pixelWidthBytes)) + (x * pixelWidthBytes);
+	//D3D_API_6(D3D->pDeviceContext, UpdateSubresource, (ID3D12Resource*)tex->tex, 0, &box, pData, tex->width, tex->width * tex->height);
 
-	return 1;
+	//return 1;
+	return 0;
 }
 
 static int D3Dnvg__renderGetTextureSize(void* uptr, int image, int* w, int* h)
 {
-	struct D3DNVGcontext* D3D = (struct D3DNVGcontext*)uptr;
-	struct D3DNVGtexture* tex = D3Dnvg__findTexture(D3D, image);
-	if (tex == NULL)
-	{
-		return 0;
-	}
-	*w = tex->width;
-	*h = tex->height;
-	return 1;
+	// TODO D3Dnvg__renderGetTextureSize
+	//struct D3DNVGcontext* D3D = (struct D3DNVGcontext*)uptr;
+	//struct D3DNVGtexture* tex = D3Dnvg__findTexture(D3D, image);
+	//if (tex == NULL)
+	//{
+	//	return 0;
+	//}
+	//*w = tex->width;
+	//*h = tex->height;
+	//return 1;
+	return 0;
 }
 
 static void D3Dnvg__xformToMat3x3(float* m3, float* t)
@@ -889,7 +901,7 @@ static void D3Dnvg__setUniforms(struct D3DNVGcontext* D3D, int uniformOffset, in
 {
 	struct D3DNVGfragUniforms* frag = nvg__fragUniformPtr(D3D, uniformOffset);
 
-	D3D12_MAPPED_SUBRESOURCE MappedResource;
+	ID3D12Resource* MappedResource;
 
 	// Pixel shader constants
 	D3D_API_5(D3D->pDeviceContext, Map, (ID3D12Resource*)D3D->pPSConstants, 0, D3D12_MAP_WRITE_DISCARD, 0, &MappedResource);
@@ -920,9 +932,8 @@ static void D3Dnvg__renderViewport(void* uptr, float width, float height, float 
 	NVG_NOTUSED(devicePixelRatio);
 
 	struct D3DNVGcontext* D3D = (struct D3DNVGcontext*)uptr;
-	D3D12_MAPPED_SUBRESOURCE mappedResource;
+	unsigned char* mappedResource;
 
-	//D3D->alphaMode = alphaBlend;
 	D3D->shader.vc.viewSize[0] = width;
 	D3D->shader.vc.viewSize[1] = height;
 
@@ -1465,7 +1476,7 @@ static void D3Dnvg__renderDelete(void* uptr)
 }
 
 
-struct NVGcontext* nvgCreateD3D12(ID3D12Device* pDevice, int flags)
+struct NVGcontext* nvgCreateD3D12(ID3D12Device* pDevice, ID3D12GraphicsCommandList* pCmdList, int flags)
 {
 	struct NVGparams params;
 	struct NVGcontext* ctx = NULL;
@@ -1476,21 +1487,7 @@ struct NVGcontext* nvgCreateD3D12(ID3D12Device* pDevice, int flags)
 	}
 	memset(D3D, 0, sizeof(struct D3DNVGcontext));
 	D3D->pDevice = pDevice;
-
-	// デバイスコンテキストの生成⇒コマンドリストの生成
-	HRESULT result;
-	result = pDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&D3D->pCommandAllocator));
-	if (FAILED(result))
-	{
-		goto error;
-	}
-	result = pDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D->pCommandAllocator, nullptr, IID_PPV_ARGS(&D3D->pCommandList));
-	if (FAILED(result))
-	{
-		D3D->pCommandAllocator->Release();
-		goto error;
-	}
-
+	D3D->pCmdList = pCmdList;
 
 
 	memset(&params, 0, sizeof(params));
@@ -1531,40 +1528,43 @@ void nvgDeleteD3D12(struct NVGcontext* ctx)
 int nvd3dCreateImageFromHandle(struct NVGcontext* ctx, void* textureId, int w, int h, int flags)
 {
 
-	/*struct D3DNVGcontext* gl = (struct D3DNVGcontext*)nvgInternalParams(ctx)->userPtr;
-	struct D3DNVGtexture* tex = D3Dnvg__allocTexture(gl);
+	//struct D3DNVGcontext* gl = (struct D3DNVGcontext*)nvgInternalParams(ctx)->userPtr;
+	//struct D3DNVGtexture* tex = D3Dnvg__allocTexture(gl);
 
-	if (tex == NULL) return 0;
+	//if (tex == NULL) return 0;
 
-	tex->type = NVG_TEXTURE_RGBA;
-	tex->tex = textureId;
-	tex->flags = flags;
-	tex->width = w;
-	tex->height = h;
+	//tex->type = NVG_TEXTURE_RGBA;
+	//tex->tex = textureId;
+	//tex->flags = flags;
+	//tex->width = w;
+	//tex->height = h;
 
-	return tex->id;
-*/
+	//return tex->id;
+
 	return 0;
 }
 
 unsigned int nvd3dImageHandle(struct NVGcontext* ctx, int image)
 {
-	/*
-	struct D3DNVGcontext* gl = (struct D3DNVGcontext*)nvgInternalParams(ctx)->userPtr;
-	struct D3DNVGtexture* tex = D3Dnvg__findTexture(gl, image);
-	return tex->tex;*/
+
+	//struct D3DNVGcontext* gl = (struct D3DNVGcontext*)nvgInternalParams(ctx)->userPtr;
+	//struct D3DNVGtexture* tex = D3Dnvg__findTexture(gl, image);
+	//return tex->tex;
 	return 0;
 }
 
 void nvd3dImageFlags(struct NVGcontext* ctx, int image, int flags)
 {
-	/*
-	struct D3DNVGcontext* gl = (struct D3DNVGcontext*)nvgInternalParams(ctx)->userPtr;
-	struct D3DNVGtexture* tex = D3Dnvg__findTexture(gl, image);
-	tex->flags = flags;
-	*/
+
+	//struct D3DNVGcontext* gl = (struct D3DNVGcontext*)nvgInternalParams(ctx)->userPtr;
+	//struct D3DNVGtexture* tex = D3Dnvg__findTexture(gl, image);
+	//tex->flags = flags;
+
 }
 #endif
 
 #endif //NANOVG_D3D12_IMPLEMENTATION
 #endif //NANOVG_D3D12_H
+
+
+//*/
